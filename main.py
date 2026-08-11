@@ -5,12 +5,18 @@ from pathlib import Path
 
 from anonymizer.analyzer import analyze_project
 from anonymizer.excel import analyze_excel_files
+from anonymizer.mapping_builder import (
+    collect_columns,
+    build_column_mapping,
+    save_mapping,
+    confirm_mappings
+)
 
 
 BASE_DIR = Path('../' + input('>>> ')).resolve()
 # OUTPUT_DIR = BASE_DIR / "COMPLETED"
 # OUTPUT_DIR.mkdir(exist_ok=True)
-MAPPING_FILE = BASE_DIR / "mapping.csv"
+MAPPING_FILE = Path("./mapping.csv")
 
 def main():
     project_dir = BASE_DIR
@@ -77,6 +83,22 @@ def main():
             # for column in sheet["columns"]:
             #     print(f"    - {column}")
             print('-' * 40)
+            
+    columns = collect_columns(excel_results)
+
+    mappings = build_column_mapping(columns)
+
+    mappings = confirm_mappings(mappings)
+
+    save_mapping(
+        mappings,
+        MAPPING_FILE,
+    )
+
+    print()
+    print(
+        f"✓ Mapping saved: {MAPPING_FILE}"
+    )
 
 
 if __name__ == "__main__":
