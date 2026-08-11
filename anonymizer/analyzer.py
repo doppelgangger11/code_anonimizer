@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from .excel import analyze_excel_files
+
 with open('./config.json', 'r') as config_file:
     config = json.load(config_file)
 
@@ -46,14 +48,12 @@ def analyze_project(project_dir: Path) -> dict:
         if not path.is_file():
             continue
 
-        # Skip excluded directories.
         if any(
             directory in EXCLUDED_DIRECTORIES
             for directory in path.parts
         ):
             continue
 
-        # Skip anonymized output directories.
         if any(
             part.endswith("_anonymized")
             for part in path.parts

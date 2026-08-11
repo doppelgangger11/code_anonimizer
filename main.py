@@ -1,8 +1,10 @@
 import json
 import pandas as pd
+from tqdm import tqdm
 from pathlib import Path
 
 from anonymizer.analyzer import analyze_project
+from anonymizer.excel import analyze_excel_files
 
 
 BASE_DIR = Path('../' + input('>>> ')).resolve()
@@ -13,18 +15,68 @@ MAPPING_FILE = BASE_DIR / "mapping.csv"
 def main():
     project_dir = BASE_DIR
 
-    files = analyze_project(project_dir)
+    # ========================================
+    # PROJECT ANALYSIS
+    # ========================================
 
     print()
-    print("Project analysis")
+    print("=" * 40)
+    print("PROJECT ANALYSIS")
     print("=" * 40)
 
+    files = analyze_project(project_dir)
+
     for file_type, paths in files.items():
+        print(
+            f"{file_type.upper():10} {len(paths)}"
+        )
 
-        print(f"\n{file_type.upper()}: {len(paths)}")
+    # ========================================
+    # EXCEL ANALYSIS
+    # ========================================
 
-        for path in paths:
-            print(f"  {path.relative_to(project_dir)}")
+    if files["excel"]:
+
+        print()
+        print("=" * 40)
+        print("EXCEL ANALYSIS")
+        print("=" * 40)
+
+        excel_results = analyze_excel_files(
+            files["excel"],
+            project_dir,
+        )
+
+        print()
+        print(
+            f"✓ Excel analysis completed: "
+            f"{len(excel_results)} files"
+        )
+
+    else:
+        excel_results = {}
+
+        print()
+        print("No Excel files found.")
+
+    print()
+
+    for file_name, workbook in excel_results.items():
+
+        for sheet_name, sheet in workbook["sheets"].items():
+            print(file_name)
+
+            print(
+                "  └──"
+                f" {sheet_name}: "
+                f"header={sheet['header_row']}, "
+                f"{sheet['rows']} rows, "
+                f"{len(sheet['columns'])} columns"
+            )
+            # print(f"  columns:")
+            # for column in sheet["columns"]:
+            #     print(f"    - {column}")
+            print('-' * 40)
 
 
 if __name__ == "__main__":
