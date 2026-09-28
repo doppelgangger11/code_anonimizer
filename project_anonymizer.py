@@ -1,525 +1,525 @@
 #!/usr/bin/env python3
 """
-project_anonymizer.py
-======================
+project_anonymizer.py — анонимизатор проектов (excel/csv + .py + .ipynb).
 
-Анонимизатор проектов: excel-файлы + jupyter-ноутбуки.
+Что делает за один запуск:
+  1. Анализирует Excel/CSV, находит текстовые колонки (эвристика по кардинальности).
+  2. Даёт подтвердить/поправить список колонок (интерактивно или флагами).
+  3. Строит ЕДИНЫЙ словарь замен  "оригинал -> токен"  (+ опционально переименование колонок).
+  4. Создаёт копию проекта, где ТОТ ЖЕ словарь применён к:
+       - Excel/CSV (значения; заголовки, если включено переименование),
+       - .py            (только строки/комментарии — идентификаторы не трогаем),
+       - .ipynb         (код-ячейки так же, markdown, outputs),
+       - имена файлов/папок, а также .md/.txt/.sql/.yaml/.json...
+     Хардкод вида df[df['client'] == 'ACME'] продолжает работать на анонимных данных.
+  5. Сохраняет mapping.csv (ключ к де-анонимизации) ВНЕ выходной папки.
 
-Идея работы:
-  1. Обходим корень проекта, находим все .xlsx/.xls файлы.
-  2. Для текстовых колонок (по умолчанию — с высокой кардинальностью,
-     т.е. похожих на имена/компании/id, а не на статусы вида "Да/Нет")
-     собираем все уникальные значения и генерируем для них
-     анонимные замены (Company_001, Client_002, ...).
-     Числа/даты/формулы/форматирование ячеек не трогаем -> типы данных
-     и вид таблиц сохраняются.
-  3. Единый словарь замен (оригинал -> анонимный токен) применяется:
-       - к самим excel-файлам (создаётся анонимизированная копия),
-       - к .ipynb (код-ячейки, markdown-ячейки и ВЫВОДЫ ячеек —
-         текстовые/HTML outputs, где значения часто "светятся" в
-         распечатках датафреймов),
-       - опционально к именам файлов/папок, если они содержат
-         чувствительные значения (например "ACME_report.xlsx").
-  4. Т.к. замена везде идёт по ОДНОМУ словарю подстрок, порядок
-     фильтраций/сравнений в коде не меняется:
-         df[df['company'] == 'ACME Corp']
-     превращается в
-         df[df['company'] == 'Company_001']
-     и т.к. в анонимизированном excel в этой же колонке будет
-     лежать 'Company_001' — код продолжает работать так же, как
-     раньше (сравнивайте это со своим кодом — динамически
-     сконструированные строки скрипт не поймает, см. ограничения
-     внизу файла).
-
-Ничего не изменяет "на месте": всегда пишет результат в отдельную
-папку (--output), оригиналы не трогаются.
-
-ВАЖНО: файл со словарём замен (anonymization_map.json) — это ключ,
-который де-анонимизирует все данные обратно. Храните его отдельно от
-анонимизированного проекта, не коммитьте в общий репозиторий/чат.
-
-Использование
--------------
-
-1) Сухой прогон — посмотреть, какие колонки скрипт considerит
-   "чувствительными", ничего не меняя:
-
-   python project_anonymizer.py analyze /path/to/project
-
-2) Анонимизация:
-
-   python project_anonymizer.py anonymize /path/to/project \
-       --output /path/to/project_anonymized \
-       --map-file /path/to/anonymization_map.json \
-       --columns "Компания,Клиент,Менеджер" \
-       --anonymize-filenames
-
-   Если --columns не указан, применяется автоэвристика (кардинальность).
-   Можно комбинировать: --columns форсирует колонки, --exclude-columns
-   исключает их, даже если эвристика их бы выбрала.
-
-3) Обратное восстановление ноутбука (для отладки, не обязательно):
-
-   python project_anonymizer.py deanonymize /path/to/notebook_anon.ipynb \
-       --map-file /path/to/anonymization_map.json \
-       --output /path/to/notebook_restored.ipynb
+Использование:
+  python project_anonymizer.py anonymize [ПАПКА] [-o OUT] [-m mapping.csv]
+         [--columns "A,B"] [--exclude-columns "C"] [--rename-columns "X,Y"|all]
+         [--threshold 0.5] [--clear-outputs] [--overwrite] [--yes]
+  python project_anonymizer.py deanonymize ПАПКА_ANON -m mapping.csv -o OUT
+Если ПАПКА не указана — спросит через input().
 """
-
 from __future__ import annotations
 
 import argparse
+import bisect
+import csv
+import io
 import json
+import os
 import re
 import shutil
 import sys
+import tokenize
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import openpyxl
 
-EXCEL_EXTS = {".xlsx", ".xlsm"}  # .xls (старый бинарный формат) openpyxl не пишет;
-                                  # при необходимости конвертируйте в .xlsx заранее.
-NOTEBOOK_EXT = ".ipynb"
-
-# Папки, которые всегда пропускаются при обходе (и при анализе, и при
-# анонимизации) — независимо от того, на каком уровне вложенности они
-# встретились. Сравнение по имени папки, регистронезависимое.
-DEFAULT_EXCLUDED_DIRS = {"backup", "archive"}
-
-
-def is_excluded(path: Path, root: Path, excluded_dirs: set) -> bool:
-    """True, если путь лежит внутри одной из исключённых папок (на любом
-    уровне вложенности относительно root)."""
-    if not excluded_dirs:
-        return False
-    try:
-        rel_parts = path.relative_to(root).parts
-    except ValueError:
-        rel_parts = path.parts
-    parent_parts = rel_parts[:-1]  # сама папка исключений, а не имя файла
-    return any(part.lower() in excluded_dirs for part in parent_parts)
-
-DEFAULT_STOPVALUES = {
-    "", "-", "—", "n/a", "na", "нет данных", "да", "нет", "yes", "no",
-    "true", "false", "unknown", "неизвестно",
-}
+EXCEL_EXTS = {".xlsx", ".xlsm"}
+CSV_EXTS = {".csv"}
+TEXT_EXTS = {".md", ".txt", ".sql", ".yml", ".yaml", ".json", ".toml", ".cfg", ".ini"}
+EXCLUDED_DIRS = {"backup", "archive", ".git", "__pycache__", ".ipynb_checkpoints",
+                 ".venv", "venv", "node_modules"}
+STOPVALUES = {"", "-", "—", "n/a", "na", "нет данных", "да", "нет", "yes", "no",
+              "true", "false", "unknown", "неизвестно", "none", "nan", "null"}
+LETTERS = "0-9A-Za-zА-Яа-яЁё"
 
 
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Вспомогательное
+# ----------------------------------------------------------------------------
 
-def sanitize_prefix(column_name: str) -> str:
-    """Превращает имя колонки в безопасный префикс для токена замены."""
-    name = re.sub(r"[^0-9A-Za-zА-Яа-яЁё]+", "_", str(column_name)).strip("_")
-    if not name:
-        name = "Value"
-    return name[:30]
+def sanitize_prefix(name: str) -> str:
+    s = re.sub(rf"[^{LETTERS}]+", "_", str(name)).strip("_")
+    return (s or "Value")[:30]
 
 
-def looks_like_stopvalue(value: str) -> bool:
-    v = value.strip().lower()
-    if v in DEFAULT_STOPVALUES:
-        return True
-    if len(v) <= 1:
-        return True
-    # чистое число / дата в виде текста — не трогаем, оно не "имя"
-    if re.fullmatch(r"[\d.,\-/: ]+", v):
-        return True
-    return False
+def is_stopvalue(v: str) -> bool:
+    s = v.strip().lower()
+    return (s in STOPVALUES or len(s) <= 1 or s.startswith("=")
+            or re.fullmatch(r"[\d.,\-/: ]+", s) is not None)
 
 
-def find_excel_files(root: Path, excluded_dirs: set = frozenset()) -> List[Path]:
-    return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in EXCEL_EXTS
-        and not is_excluded(p, root, excluded_dirs)
-    )
+def walk(root: Path, skip: Optional[Path] = None) -> Iterator[Path]:
+    for dp, dns, fns in os.walk(root):
+        dns[:] = sorted(d for d in dns if d.lower() not in EXCLUDED_DIRS
+                        and (skip is None or (Path(dp) / d).resolve() != skip))
+        for fn in sorted(fns):
+            if not fn.startswith("~$"):
+                yield Path(dp) / fn
 
 
-def find_notebooks(root: Path, excluded_dirs: set = frozenset()) -> List[Path]:
-    return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() == NOTEBOOK_EXT
-        and not is_excluded(p, root, excluded_dirs)
-    )
+def detect_header(rows: List[list]) -> int:
+    for i, row in enumerate(rows):
+        vals = [v for v in row if v not in (None, "")]
+        if len(vals) >= 2 and sum(isinstance(v, str) for v in vals) >= 0.8 * len(vals):
+            return i
+    return 0
 
 
-# ---------------------------------------------------------------------------
-# Шаг 1: анализ excel-файлов -> кандидаты на анонимизацию
-# ---------------------------------------------------------------------------
-
-class ColumnStats:
-    __slots__ = ("values", "total", "file_sheet_col")
-
-    def __init__(self):
-        self.values: set = set()
-        self.total: int = 0
-        self.file_sheet_col: List[Tuple[str, str, str]] = []
-
-
-def collect_column_stats(excel_files: List[Path]) -> Dict[str, ColumnStats]:
-    """
-    Собирает статистику по КОЛОНКАМ (ключ = имя колонки, т.е. заголовок
-    из первой строки листа). Если одноимённые колонки встречаются в
-    разных файлах/листах — статистика объединяется, это и нужно, чтобы
-    эвристика кардинальности работала на всём проекте сразу.
-    """
-    stats: Dict[str, ColumnStats] = defaultdict(ColumnStats)
-
-    for path in excel_files:
+def read_csv(path: Path):
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "cp1251"):
         try:
-            wb = openpyxl.load_workbook(path, data_only=False, read_only=True)
-        except Exception as e:
-            print(f"  [!] Не смог открыть {path}: {e}", file=sys.stderr)
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
             continue
+    else:
+        raise ValueError("unknown encoding")
+    try:
+        delim = csv.Sniffer().sniff(text[:5000], delimiters=",;\t|").delimiter
+    except csv.Error:
+        delim = ","
+    return list(csv.reader(io.StringIO(text), delimiter=delim)), enc, delim
 
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            rows = ws.iter_rows(values_only=True)
-            try:
-                header = next(rows)
-            except StopIteration:
-                continue
-            header = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(header)]
 
-            for row in rows:
-                for col_name, cell_value in zip(header, row):
-                    if not isinstance(cell_value, str):
-                        continue
-                    st = stats[col_name]
-                    st.total += 1
-                    if not looks_like_stopvalue(cell_value):
-                        st.values.add(cell_value)
-                        st.file_sheet_col.append((str(path), sheet_name, col_name))
-        wb.close()
+def iter_tables(path: Path):
+    """yield (label, header, data_rows)"""
+    if path.suffix.lower() in EXCEL_EXTS:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=False)
+        try:
+            for ws in wb.worksheets:
+                rows = [list(r) for r in ws.iter_rows(values_only=True)]
+                if not rows:
+                    continue
+                h = detect_header(rows[:30])
+                header = [str(v).strip() if v not in (None, "") else f"col_{i}"
+                          for i, v in enumerate(rows[h])]
+                yield ws.title, header, rows[h + 1:]
+        finally:
+            wb.close()
+    else:
+        rows, _, _ = read_csv(path)
+        if rows:
+            h = detect_header(rows[:30])
+            yield path.name, [c.strip() or f"col_{i}" for i, c in enumerate(rows[h])], rows[h + 1:]
 
+
+# ----------------------------------------------------------------------------
+# Анализ и построение словаря
+# ----------------------------------------------------------------------------
+
+class ColStats:
+    def __init__(self):
+        self.values, self.total = set(), 0
+
+
+def collect_stats(tables_files: List[Path]) -> Dict[str, ColStats]:
+    stats: Dict[str, ColStats] = defaultdict(ColStats)
+    for p in tables_files:
+        try:
+            for _, header, rows in iter_tables(p):
+                for c in header:
+                    stats[c]  # зарегистрировать колонку (даже без текста)
+                for row in rows:
+                    for c, v in zip(header, row):
+                        if isinstance(v, str):
+                            st = stats[c]
+                            st.total += 1
+                            if not is_stopvalue(v):
+                                st.values.add(v)
+        except Exception as e:
+            print(f"  [!] не смог прочитать {p}: {e}", file=sys.stderr)
     return stats
 
 
-def choose_sensitive_columns(
-    stats: Dict[str, ColumnStats],
-    force_include: Optional[set] = None,
-    force_exclude: Optional[set] = None,
-    cardinality_threshold: float = 0.5,
-    min_unique: int = 2,
-) -> List[str]:
-    force_include = force_include or set()
-    force_exclude = force_exclude or set()
-    chosen = []
-    for col, st in stats.items():
-        if col in force_exclude:
+def choose_columns(stats, include, exclude, threshold) -> List[str]:
+    out = []
+    for c, st in stats.items():
+        if c in exclude:
             continue
-        if col in force_include:
-            chosen.append(col)
-            continue
-        if st.total == 0:
-            continue
-        ratio = len(st.values) / st.total
-        if len(st.values) >= min_unique and ratio >= cardinality_threshold:
-            chosen.append(col)
-    return sorted(set(chosen))
+        if c in include or (st.total and len(st.values) >= 2
+                            and len(st.values) / st.total >= threshold):
+            out.append(c)
+    return sorted(out)
 
 
-# ---------------------------------------------------------------------------
-# Шаг 2: построение словаря замен
-# ---------------------------------------------------------------------------
+def confirm_columns(stats, chosen: List[str]) -> List[str]:
+    cols = sorted(c for c, s in stats.items() if s.total)
+    sel = set(chosen)
+    while True:
+        print("\nТекстовые колонки ([x] = будет анонимизирована):")
+        for i, c in enumerate(cols, 1):
+            st = stats[c]
+            print(f"  [{'x' if c in sel else ' '}] {i:>3}. {c!r}  ({len(st.values)} уник. / {st.total})")
+        s = input("Номера для переключения (через пробел), Enter — принять: ").strip()
+        if not s:
+            return sorted(sel)
+        for t in s.replace(",", " ").split():
+            if t.isdigit() and 1 <= int(t) <= len(cols):
+                sel ^= {cols[int(t) - 1]}
 
-def build_value_mapping(
-    excel_files: List[Path],
-    sensitive_columns: List[str],
-) -> Tuple[Dict[str, str], List[dict]]:
-    """
-    Возвращает:
-      value_map: {оригинальное_значение: анонимный_токен}   (глобально)
-      audit: список записей для отчёта (файл/лист/колонка/было/стало)
-    """
-    sensitive_set = set(sensitive_columns)
-    value_map: Dict[str, str] = {}
-    counters: Dict[str, int] = defaultdict(int)
-    audit: List[dict] = []
 
-    for path in excel_files:
+def build_value_map(files: List[Path], sensitive: List[str]):
+    sens, vmap, counters = set(sensitive), {}, defaultdict(int)
+    for p in files:
         try:
-            wb = openpyxl.load_workbook(path, data_only=False, read_only=True)
+            for _, header, rows in iter_tables(p):
+                idx = [i for i, c in enumerate(header) if c in sens]
+                for row in rows:
+                    for i in idx:
+                        v = row[i] if i < len(row) else None
+                        if isinstance(v, str) and not is_stopvalue(v) and v not in vmap:
+                            pre = sanitize_prefix(header[i])
+                            counters[pre] += 1
+                            vmap[v] = f"{pre}_{counters[pre]:03d}"
         except Exception:
             continue
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            rows = ws.iter_rows(values_only=True)
-            try:
-                header = next(rows)
-            except StopIteration:
-                continue
-            header = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(header)]
-
-            for row in rows:
-                for col_name, cell_value in zip(header, row):
-                    if col_name not in sensitive_set:
-                        continue
-                    if not isinstance(cell_value, str) or looks_like_stopvalue(cell_value):
-                        continue
-                    if cell_value in value_map:
-                        continue
-                    prefix = sanitize_prefix(col_name)
-                    counters[prefix] += 1
-                    token = f"{prefix}_{counters[prefix]:03d}"
-                    value_map[cell_value] = token
-                    audit.append({
-                        "file": str(path),
-                        "sheet": sheet_name,
-                        "column": col_name,
-                        "original": cell_value,
-                        "anonymized": token,
-                    })
-        wb.close()
-
-    return value_map, audit
+    return vmap
 
 
-# ---------------------------------------------------------------------------
-# Шаг 3: применение словаря к excel-файлам
-# ---------------------------------------------------------------------------
-
-def anonymize_excel_file(src: Path, dst: Path, value_map: Dict[str, str]) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    wb = openpyxl.load_workbook(src, data_only=False)  # полная загрузка -> сохранит формулы/формат
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                if isinstance(cell.value, str) and cell.value in value_map:
-                    cell.value = value_map[cell.value]  # число/дата-форматирование ячейки не трогаем
-    wb.save(dst)
+def build_column_map(cols: List[str]) -> Dict[str, str]:
+    cols = [c for c in sorted(cols) if not re.fullmatch(r"col_\d+", c)]
+    return {c: f"Column_{i:03d}" for i, c in enumerate(cols, 1)}
 
 
-# ---------------------------------------------------------------------------
-# Шаг 4: применение словаря к .ipynb (код, markdown, outputs)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Замена в тексте / коде
+# ----------------------------------------------------------------------------
 
-def compile_replacer(value_map: Dict[str, str]) -> Optional[re.Pattern]:
-    if not value_map:
+def make_pattern(mapping: Dict[str, str]) -> Optional[re.Pattern]:
+    if not mapping:
         return None
-    # заменяем сначала более длинные значения, чтобы избежать
-    # "порчи" при вложенных подстроках ("ACME" внутри "ACME Corp")
-    keys = sorted(value_map.keys(), key=len, reverse=True)
-    pattern = "|".join(re.escape(k) for k in keys)
-    return re.compile(pattern)
+    alt = "|".join(re.escape(k) for k in sorted(mapping, key=len, reverse=True))
+    return re.compile(rf"(?<![{LETTERS}])(?:{alt})(?![{LETTERS}])")
 
 
-def replace_text(text: str, value_map: Dict[str, str], pattern: re.Pattern) -> str:
-    return pattern.sub(lambda m: value_map[m.group(0)], text)
+def sub_text(text: str, mapping, pat, protected: Optional[List[Tuple[int, int]]] = None) -> str:
+    if pat is None or not text:
+        return text
+    starts = [s for s, _ in protected] if protected else []
+
+    def repl(m):
+        if protected:
+            i = bisect.bisect_right(starts, m.start()) - 1
+            if i >= 0 and protected[i][1] > m.start():
+                return m.group(0)
+            if i + 1 < len(protected) and protected[i + 1][0] < m.end():
+                return m.group(0)
+        return mapping[m.group(0)]
+    return pat.sub(repl, text)
 
 
-def _replace_in_source(source, value_map, pattern):
-    """source в .ipynb — это либо строка, либо список строк."""
-    if isinstance(source, list):
-        return [replace_text(line, value_map, pattern) for line in source]
-    if isinstance(source, str):
-        return replace_text(source, value_map, pattern)
-    return source
+def name_spans(code: str) -> List[Tuple[int, int]]:
+    """Позиции идентификаторов (NAME-токенов): их менять нельзя.
+    Строки IPython-магий (% и !) маскируем '#', сохраняя смещения."""
+    parts = code.split("\n")
+    lines = [l + "\n" for l in parts[:-1]] + [parts[-1]]
+    masked = []
+    for l in lines:
+        s = l.lstrip()
+        if s[:1] in ("%", "!"):
+            i = len(l) - len(s)
+            l = l[:i] + "#" + l[i + 1:]
+        masked.append(l)
+    offs = [0]
+    for l in lines:
+        offs.append(offs[-1] + len(l))
+    spans = []
+    for t in tokenize.generate_tokens(io.StringIO("".join(masked)).readline):
+        if t.type == tokenize.NAME:
+            (sr, sc), (er, ec) = t.start, t.end
+            spans.append((offs[sr - 1] + sc, offs[er - 1] + ec))
+    return sorted(spans)
 
 
-def anonymize_notebook_file(src: Path, dst: Path, value_map: Dict[str, str]) -> None:
-    pattern = compile_replacer(value_map)
-    with open(src, "r", encoding="utf-8") as f:
-        nb = json.load(f)
+def sub_code(code: str, mapping, pat) -> str:
+    if pat is None:
+        return code
+    try:
+        spans = name_spans(code)
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return sub_text(code, mapping, pat)  # не разобрался — обычная замена по границам слов
+    return sub_text(code, mapping, pat, spans)
 
-    if pattern is not None:
+
+# ----------------------------------------------------------------------------
+# Обработчики файлов
+# ----------------------------------------------------------------------------
+
+class Transformer:
+    def __init__(self, vmap, cmap, clear_outputs=False):
+        self.vmap, self.cmap, self.clear_outputs = vmap, cmap, clear_outputs
+        self.text_map = {**vmap, **cmap}
+        self.pat = make_pattern(self.text_map)
+
+    # --- excel ---
+    def excel(self, src: Path, dst: Path):
+        wb = openpyxl.load_workbook(src, keep_vba=src.suffix.lower() == ".xlsm")
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows())
+            if not rows:
+                continue
+            h = detect_header([[c.value for c in r] for r in rows[:30]])
+            for ri, row in enumerate(rows):
+                for c in row:
+                    v = c.value
+                    if not isinstance(v, str) or v.startswith("="):
+                        continue
+                    new = (self.cmap.get(v.strip(), self.vmap.get(v)) if ri == h
+                           else self.vmap.get(v))
+                    if new is not None:
+                        c.value = new
+        wb.save(dst)
+
+    # --- csv ---
+    def csv(self, src: Path, dst: Path):
+        rows, enc, delim = read_csv(src)
+        if rows:
+            h = detect_header(rows[:30])
+            for ri, row in enumerate(rows):
+                for ci, v in enumerate(row):
+                    new = (self.cmap.get(v.strip(), self.vmap.get(v)) if ri == h
+                           else self.vmap.get(v))
+                    if new is not None:
+                        row[ci] = new
+        with open(dst, "w", encoding=enc, newline="") as f:
+            csv.writer(f, delimiter=delim).writerows(rows)
+
+    # --- py ---
+    def py(self, src: Path, dst: Path):
+        dst.write_text(sub_code(src.read_text(encoding="utf-8"), self.text_map, self.pat),
+                       encoding="utf-8")
+
+    def text(self, src: Path, dst: Path):
+        dst.write_text(sub_text(src.read_text(encoding="utf-8"), self.text_map, self.pat),
+                       encoding="utf-8")
+
+    # --- ipynb ---
+    def _src(self, source, fn):
+        if isinstance(source, list):
+            joined = fn("".join(source))
+            return joined.splitlines(keepends=True)
+        return fn(source) if isinstance(source, str) else source
+
+    def ipynb(self, src: Path, dst: Path):
+        nb = json.loads(src.read_text(encoding="utf-8"))
+        code = lambda s: sub_code(s, self.text_map, self.pat)
+        text = lambda s: sub_text(s, self.text_map, self.pat)
         for cell in nb.get("cells", []):
+            fn = code if cell.get("cell_type") == "code" else text
             if "source" in cell:
-                cell["source"] = _replace_in_source(cell["source"], value_map, pattern)
-
-            for output in cell.get("outputs", []) or []:
-                if "text" in output:
-                    output["text"] = _replace_in_source(output["text"], value_map, pattern)
-                data = output.get("data")
+                cell["source"] = self._src(cell["source"], fn)
+            if cell.get("cell_type") != "code":
+                continue
+            if self.clear_outputs:
+                cell["outputs"], cell["execution_count"] = [], None
+                continue
+            for out in cell.get("outputs", []) or []:
+                if "text" in out:
+                    out["text"] = self._src(out["text"], text)
+                if "evalue" in out:
+                    out["evalue"] = text(out["evalue"])
+                if "traceback" in out:
+                    out["traceback"] = [text(t) for t in out["traceback"]]
+                data = out.get("data")
                 if isinstance(data, dict):
-                    for mime, payload in list(data.items()):
-                        if mime.startswith("text/"):  # text/plain, text/html — не бинарные
-                            data[mime] = _replace_in_source(payload, value_map, pattern)
+                    for mime in list(data):
+                        if mime.startswith("text/") or mime == "application/json":
+                            if isinstance(data[mime], (str, list)):
+                                data[mime] = self._src(data[mime], text)
+        dst.write_text(json.dumps(nb, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with open(dst, "w", encoding="utf-8") as f:
-        json.dump(nb, f, ensure_ascii=False, indent=1)
+    def rename(self, rel: Path) -> Path:
+        return Path(*[sub_text(p, self.text_map, self.pat) for p in rel.parts])
 
-
-# ---------------------------------------------------------------------------
-# Шаг 5 (опционально): анонимизация имён файлов/папок
-# ---------------------------------------------------------------------------
-
-def anonymize_path_name(name: str, value_map: Dict[str, str], pattern: Optional[re.Pattern]) -> str:
-    if pattern is None:
-        return name
-    return replace_text(name, value_map, pattern)
-
-
-# ---------------------------------------------------------------------------
-# Оркестрация
-# ---------------------------------------------------------------------------
-
-def cmd_analyze(args):
-    root = Path(args.root)
-    excluded_dirs = set(x.strip().lower() for x in args.exclude_dirs.split(",") if x.strip())
-    print(f"Исключённые папки: {sorted(excluded_dirs) or 'нет'}")
-    excel_files = find_excel_files(root, excluded_dirs)
-    print(f"Найдено excel-файлов: {len(excel_files)}")
-    stats = collect_column_stats(excel_files)
-    chosen = choose_sensitive_columns(
-        stats,
-        cardinality_threshold=args.cardinality_threshold,
-    )
-    print("\nКолонки-кандидаты на анонимизацию (эвристика по кардинальности):")
-    for col in chosen:
-        st = stats[col]
-        ratio = len(st.values) / st.total if st.total else 0
-        print(f"  - {col!r}: {len(st.values)} уникальных / {st.total} значений (ratio={ratio:.2f})")
-    print("\nОстальные текстовые колонки (НЕ будут анонимизированы по умолчанию):")
-    for col, st in stats.items():
-        if col in chosen:
-            continue
-        ratio = len(st.values) / st.total if st.total else 0
-        print(f"  - {col!r}: {len(st.values)} уникальных / {st.total} значений (ratio={ratio:.2f})")
-    print(
-        "\nЕсли эвристика выбрала не то — используйте --columns / --exclude-columns "
-        "в команде anonymize."
-    )
+    def process(self, src: Path, dst: Path):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        ext = src.suffix.lower()
+        try:
+            if ext in EXCEL_EXTS:
+                self.excel(src, dst)
+            elif ext in CSV_EXTS:
+                self.csv(src, dst)
+            elif ext == ".ipynb":
+                self.ipynb(src, dst)
+            elif ext == ".py":
+                self.py(src, dst)
+            elif ext in TEXT_EXTS:
+                self.text(src, dst)
+            else:
+                shutil.copy2(src, dst)
+        except Exception as e:
+            print(f"  [!] {src}: {e} — файл скопирован без изменений", file=sys.stderr)
+            shutil.copy2(src, dst)
 
 
-def cmd_anonymize(args):
-    root = Path(args.root)
-    output_root = Path(args.output) if args.output else root.parent / (root.name + "_anonymized")
-    map_file = Path(args.map_file) if args.map_file else output_root.parent / (root.name + "_anonymization_map.json")
-
-    force_include = set(x.strip() for x in args.columns.split(",")) if args.columns else set()
-    force_exclude = set(x.strip() for x in args.exclude_columns.split(",")) if args.exclude_columns else set()
-    excluded_dirs = set(x.strip().lower() for x in args.exclude_dirs.split(",") if x.strip())
-
-    excel_files = find_excel_files(root, excluded_dirs)
-    notebooks = find_notebooks(root, excluded_dirs)
-    print(f"Исключённые папки: {sorted(excluded_dirs) or 'нет'}")
-    print(f"Excel-файлов: {len(excel_files)}, ноутбуков: {len(notebooks)}")
-
-    stats = collect_column_stats(excel_files)
-    sensitive_columns = choose_sensitive_columns(
-        stats,
-        force_include=force_include,
-        force_exclude=force_exclude,
-        cardinality_threshold=args.cardinality_threshold,
-    )
-    print(f"Анонимизируемые колонки: {sensitive_columns}")
-
-    value_map, audit = build_value_mapping(excel_files, sensitive_columns)
-    print(f"Уникальных значений для замены: {len(value_map)}")
-
-    # -- копируем всё дерево проекта как есть --
-    if output_root.exists():
-        if args.overwrite:
-            shutil.rmtree(output_root)
-        else:
-            print(f"[!] {output_root} уже существует. Используйте --overwrite.", file=sys.stderr)
-            sys.exit(1)
-    def ignore_excluded(dir_path, names):
-        # shutil.copytree's ignore callback: возвращаем имена, которые
-        # НЕ нужно копировать. Так backup/archive не попадут в
-        # анонимизированный вывод вообще — иначе там остались бы
-        # неанонимизированные исходники, что сводит на нет весь смысл.
-        if not excluded_dirs:
-            return set()
-        return {n for n in names if n.lower() in excluded_dirs}
-
-    shutil.copytree(root, output_root, ignore=ignore_excluded)
-    if excluded_dirs:
-        print(f"  (папки {sorted(excluded_dirs)} пропущены целиком, в вывод не копировались)")
-
-    # -- перезаписываем excel анонимизированными версиями --
-    for src in excel_files:
+def process_project(root: Path, out: Path, vmap, cmap, clear_outputs=False):
+    tr = Transformer(vmap, cmap, clear_outputs)
+    files = list(walk(root, skip=out.resolve()))
+    for i, src in enumerate(files, 1):
         rel = src.relative_to(root)
-        dst = output_root / rel
-        anonymize_excel_file(src, dst, value_map)
-
-    # -- перезаписываем ноутбуки --
-    for src in notebooks:
-        rel = src.relative_to(root)
-        dst = output_root / rel
-        anonymize_notebook_file(src, dst, value_map)
-
-    filename_map = {}
-    if args.anonymize_filenames:
-        pattern = compile_replacer(value_map)
-        if pattern is not None:
-            # переименовываем файлы/папки снизу вверх, чтобы не сломать пути
-            all_paths = sorted(output_root.rglob("*"), key=lambda p: len(p.parts), reverse=True)
-            for p in all_paths:
-                new_name = anonymize_path_name(p.name, value_map, pattern)
-                if new_name != p.name:
-                    new_path = p.with_name(new_name)
-                    p.rename(new_path)
-                    filename_map[str(p.relative_to(output_root))] = str(new_path.relative_to(output_root))
-
-    # -- сохраняем словарь-ключ отдельно от анонимизированного проекта --
-    map_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(map_file, "w", encoding="utf-8") as f:
-        json.dump({
-            "values": value_map,
-            "filenames": filename_map,
-            "audit": audit,
-        }, f, ensure_ascii=False, indent=2)
-
-    print(f"\nГотово.")
-    print(f"  Анонимизированный проект: {output_root}")
-    print(f"  Словарь-ключ (ХРАНИТЬ ОТДЕЛЬНО, НЕ ПУБЛИКОВАТЬ): {map_file}")
+        tr.process(src, out / tr.rename(rel))
+        print(f"\r  обработано {i}/{len(files)}", end="", flush=True)
+    print()
+    return tr
 
 
-def cmd_deanonymize(args):
-    with open(args.map_file, "r", encoding="utf-8") as f:
-        m = json.load(f)
-    reverse_map = {v: k for k, v in m["values"].items()}
-    anonymize_notebook_file(Path(args.notebook), Path(args.output), reverse_map)
-    print(f"Восстановлено: {args.output}")
+# ----------------------------------------------------------------------------
+# mapping.csv
+# ----------------------------------------------------------------------------
+
+def save_mapping(path: Path, vmap, cmap):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["kind", "original", "anonymized"])
+        for k, v in cmap.items():
+            w.writerow(["column", k, v])
+        for k, v in vmap.items():
+            w.writerow(["value", k, v])
 
 
-def build_arg_parser():
-    p = argparse.ArgumentParser(description="Анонимизатор excel + jupyter проектов")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def load_mapping(path: Path):
+    vmap, cmap = {}, {}
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            (cmap if r["kind"] == "column" else vmap)[r["original"]] = r["anonymized"]
+    return vmap, cmap
 
-    a = sub.add_parser("analyze", help="Сухой прогон: показать колонки-кандидаты")
-    a.add_argument("root")
-    a.add_argument("--cardinality-threshold", type=float, default=0.5)
-    a.add_argument(
-        "--exclude-dirs", default="backup,archive",
-        help="Через запятую: папки, полностью пропускаемые при обходе (по умолчанию: backup,archive)",
-    )
-    a.set_defaults(func=cmd_analyze)
 
-    b = sub.add_parser("anonymize", help="Выполнить анонимизацию")
-    b.add_argument("root")
-    b.add_argument("--output", help="Куда писать анонимизированный проект")
-    b.add_argument("--map-file", help="Куда писать словарь-ключ (JSON)")
-    b.add_argument("--columns", help="Через запятую: форсировать эти колонки")
-    b.add_argument("--exclude-columns", help="Через запятую: исключить эти колонки")
-    b.add_argument("--cardinality-threshold", type=float, default=0.5)
-    b.add_argument("--anonymize-filenames", action="store_true")
-    b.add_argument("--overwrite", action="store_true")
-    b.add_argument(
-        "--exclude-dirs", default="backup,archive",
-        help="Через запятую: папки, полностью пропускаемые при обходе и НЕ копируемые в вывод "
-             "(по умолчанию: backup,archive)",
-    )
-    b.set_defaults(func=cmd_anonymize)
+def leftover_check(out: Path, vmap, cmap):
+    """Ищем оригиналы, оставшиеся в .py/.ipynb (склейки строк, картинки и т.п.)."""
+    keys = [k for k in {**vmap, **cmap} if len(k) >= 4]
+    if not keys:
+        return
+    pat = re.compile("|".join(re.escape(k) for k in sorted(keys, key=len, reverse=True)))
+    bad = []
+    for p in walk(out):
+        if p.suffix.lower() in (".py", ".ipynb"):
+            try:
+                m = pat.search(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if m:
+                bad.append((p.relative_to(out), m.group(0)))
+    if bad:
+        print("\n[!] В этих файлах остались оригинальные значения — проверьте вручную")
+        print("    (динамически собранные строки, значения в картинках-выводах и т.п.):")
+        for p, k in bad:
+            print(f"    - {p}  (например: {k!r})")
+    else:
+        print("\n✓ Проверка: оригинальных значений в .py/.ipynb не найдено.")
 
-    c = sub.add_parser("deanonymize", help="Восстановить один ноутбук по словарю (для отладки)")
-    c.add_argument("notebook")
-    c.add_argument("--map-file", required=True)
-    c.add_argument("--output", required=True)
-    c.set_defaults(func=cmd_deanonymize)
 
-    return p
+# ----------------------------------------------------------------------------
+# Команды
+# ----------------------------------------------------------------------------
+
+def split_list(s: Optional[str]) -> set:
+    return {x.strip() for x in s.split(",") if x.strip()} if s else set()
+
+
+def cmd_anonymize(a):
+    root = Path(a.root or input(">>> ")).expanduser().resolve()
+    if not root.is_dir():
+        sys.exit(f"Папка не найдена: {root}")
+    out = Path(a.output).resolve() if a.output else root.parent / f"{root.name}_anonymized"
+    map_file = Path(a.map_file).resolve() if a.map_file else root.parent / f"{root.name}_mapping.csv"
+    if root in out.parents or out == root:
+        sys.exit("Выходная папка не должна лежать внутри проекта.")
+    if out.exists():
+        if not a.overwrite:
+            sys.exit(f"{out} уже существует (используйте --overwrite).")
+        shutil.rmtree(out)
+
+    all_files = list(walk(root))
+    tables = [p for p in all_files if p.suffix.lower() in EXCEL_EXTS | CSV_EXTS]
+    from collections import Counter
+    cnt = Counter(p.suffix.lower() for p in all_files)
+    print(f"Файлов: {len(all_files)} | excel: {sum(cnt[e] for e in EXCEL_EXTS)} "
+          f"| csv: {cnt['.csv']} | py: {cnt['.py']} | ipynb: {cnt['.ipynb']}")
+
+    stats = collect_stats(tables)
+    chosen = choose_columns(stats, split_list(a.columns), split_list(a.exclude_columns), a.threshold)
+    if not a.yes:
+        chosen = confirm_columns(stats, chosen)
+    print(f"\nАнонимизируемые колонки: {chosen}")
+    vmap = build_value_map(tables, chosen)
+    print(f"Уникальных значений для замены: {len(vmap)}")
+
+    cmap = {}
+    ren = a.rename_columns
+    if ren is None and not a.yes:
+        ren = input("Переименовать названия колонок? [Enter — нет / all / список через запятую]: ").strip() or None
+    if ren:
+        cols = list(stats) if ren.lower() == "all" else list(split_list(ren))
+        cmap = build_column_map(cols)
+        print(f"Колонок к переименованию: {len(cmap)}")
+
+    save_mapping(map_file, vmap, cmap)  # сначала ключ — чтобы не потерять при сбое
+    print("\nАнонимизация проекта...")
+    process_project(root, out, vmap, cmap, a.clear_outputs)
+    leftover_check(out, vmap, cmap)
+
+    print("\nГотово.")
+    print(f"  Проект:  {out}")
+    print(f"  Ключ:    {map_file}   <- хранить ОТДЕЛЬНО, не публиковать")
+
+
+def cmd_deanonymize(a):
+    root, out = Path(a.root).resolve(), Path(a.output).resolve()
+    vmap, cmap = load_mapping(Path(a.map_file))
+    inv_v = {v: k for k, v in vmap.items()}
+    inv_c = {v: k for k, v in cmap.items()}
+    if out.exists() and not a.overwrite:
+        sys.exit(f"{out} уже существует (используйте --overwrite).")
+    if out.exists():
+        shutil.rmtree(out)
+    process_project(root, out, inv_v, inv_c)
+    print(f"Восстановлено: {out}")
 
 
 def main():
-    parser = build_arg_parser()
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Анонимизатор проектов (excel/csv + py + ipynb)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("anonymize")
+    a.add_argument("root", nargs="?")
+    a.add_argument("-o", "--output")
+    a.add_argument("-m", "--map-file")
+    a.add_argument("--columns", help="форсировать колонки (через запятую)")
+    a.add_argument("--exclude-columns", help="исключить колонки (через запятую)")
+    a.add_argument("--rename-columns", help="'all' или список названий колонок")
+    a.add_argument("--threshold", type=float, default=0.5)
+    a.add_argument("--clear-outputs", action="store_true", help="очистить outputs в ноутбуках")
+    a.add_argument("--overwrite", action="store_true")
+    a.add_argument("--yes", action="store_true", help="без интерактивных вопросов")
+    a.set_defaults(func=cmd_anonymize)
+
+    d = sub.add_parser("deanonymize")
+    d.add_argument("root")
+    d.add_argument("-m", "--map-file", required=True)
+    d.add_argument("-o", "--output", required=True)
+    d.add_argument("--overwrite", action="store_true")
+    d.set_defaults(func=cmd_deanonymize)
+
+    args = p.parse_args()
     args.func(args)
 
 
